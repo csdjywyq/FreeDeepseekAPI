@@ -616,10 +616,25 @@ FreeDeepseekAPI 接受：
 - 带显式 `tool_call`、`tool_calls` 或 `function_call` 外层结构的围栏 JSON
 - `<tool_call>...</tool_call>`
 - DeepSeek DSML（`<｜DSML｜tool_calls>...`）以及网页版变体 `<｜｜DSML｜｜ Tool Calls>`
+  与 `<｜｜DSML｜｜ calls>`
 
 解析时会修正模型的典型错误：Windows 路径中未转义的反斜杠
-（`"C:\git\src\index.ts"`）以及字符串参数中的真实换行。
-标注了其他语言的代码块（```` ```csharp ````、```` ```python ````）永远不会被当作工具调用。
+（`"C:\git\src\index.ts"`）、字符串参数中的真实换行，以及只差最后一个根括号的
+JSON（输出被上限截断时最常见，树本身完整才补，字符串被截断则一律拒绝）。
+标注了其他语言的代码块（```` ```csharp ````、```` ```python ````）永远不会被当作工具调用；
+但工具参数内部引用的 Markdown 围栏（例如要写入的含 ```` ```bash ```` 的文档）会原样保留，
+不会被当作代码块剥掉。
+
+参数值里出现的 `<invoke>`、`</parameter>` 这类**字面文本**按参数内容处理，不会提前
+截断调用——写 HTML 模板或 XML 示例的客户端常会撞上这一点。
+
+一个 DSML wrapper 里出现多个 `invoke`（网页版做多查询搜索时很常见）会作为**并行工具
+调用**返回：响应里是一条 assistant 消息带 N 个 `tool_calls`，流式输出按 `index` 区分，
+Anthropic 与 Responses 两种格式同样逐个下发。上限 8 个，超过按格式错误处理。
+
+如果模型连续两次写坏结构，请求返回 `502 malformed_tool_call`（绝不把原始标记当正文
+返回），并把原始响应存到 `logs/parse-failures/`（保留最近 50 份，`PARSE_FAILURE_DUMP=0`
+可关闭），响应体的 `dump_file` 字段给出对应文件名。
 
 ---
 

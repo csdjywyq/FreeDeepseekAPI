@@ -1038,8 +1038,14 @@ const MAX_TOOL_MARKUP_CHARS = 256 * 1024;
 const MAX_TOOL_ARGUMENT_CHARS = 128 * 1024;
 const MAX_TOOL_JSON_CANDIDATES = 32;
 const MAX_DSML_PARAMETERS = 128;
-const MAX_DSML_STRUCTURAL_TAGS = MAX_DSML_PARAMETERS * 2 + 16;
-const MAX_DSML_TAG_CHARS = 2048;
+// A tool turn may legitimately carry several parallel calls (multi-query
+// searches). Beyond this the answer is treated as malformed.
+const MAX_PARALLEL_TOOL_CALLS = 8;
+// Argument values often quote markup (HTML templates, XML fixtures, the DSML
+// format itself). Those look like tags, so the budget covers tag-like text,
+// not just real structure: 2 tags per parameter plus generous slack.
+const MAX_DSML_STRUCTURAL_TAGS = 4096;
+const MAX_DSML_TAG_CHARS = 8192;
 
 function extractBalancedJsonAt(text, startIndex) {
     if (text[startIndex] !== '{') return null;
@@ -1217,6 +1223,33 @@ function coerceToolCallObject(obj, { allowBare = false } = {}) {
     );
 }
 
+// A response cut off by the output limit usually misses only the final root
+// brace: the JSON tree itself is complete. Close exactly one missing root
+// brace — a deeper gap means the arguments themselves may be incomplete, so
+// those stay rejected.
+function closeMissingRootBrace(raw) {
+    const text = String(raw || '').trim();
+    if (!text.startsWith('{')) return null;
+    const stack = [];
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (escape) { escape = false; continue; }
+        if (ch === '\\' && inString) { escape = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === '{' || ch === '[') {
+            stack.push(ch);
+        } else if (ch === '}' || ch === ']') {
+            const open = stack.pop();
+            if (!open || (open === '{' ? ch !== '}' : ch !== ']')) return null;
+        }
+    }
+    if (inString || stack.length !== 1 || stack[0] !== '{') return null;
+    return text + '}';
+}
+
 function parseJsonToolCandidate(raw, label = 'json', options = {}) {
     if (!raw) return null;
     try {
@@ -1252,6 +1285,9 @@ function canonicalizeToolMarkupTag(rawTag) {
         token = token.substring(1).trim();
     }
     token = token.replace(/^DSML(?=(?:tool[\s_-]*calls|function[\s_-]*calls|invoke|parameter)\b)/i, '');
+    // The Web build also emits a bare "<｜｜DSML｜｜ calls>" wrapper; without
+    // this alias the whole call degenerates into argument text.
+    if (/^(?:tool[\s_-]*)?calls?$/i.test(token)) token = 'tool_calls';
 
     if (!closing && /^name\s*=/i.test(token)) return `<direct ${token}>`;
 
@@ -1382,67 +1418,146 @@ function parseDsmlParameter(attrs, rawBody, args, seenNames) {
     return true;
 }
 
+// Pair <parameter> containers from the tail backwards. A real closing tag is
+// always the LAST one in its block, so a value that literally contains markup
+// such as `if (line === "</parameter>")` no longer truncates the argument.
+// Every byte between blocks must be whitespace, so trailing junk, a truncated
+// parameter and a second unparsable invoke are still rejected.
+function matchParameterBlocks(body, openings, closings) {
+    const cache = new Map();
+    let budget = 20000;
+    const solve = (endPos) => {
+        if (cache.has(endPos)) return cache.get(endPos);
+        if (budget <= 0) return null;
+        let result = null;
+        if (!body.substring(0, endPos).trim()) {
+            result = [];
+        } else {
+            for (const closing of closings) {
+                if (closing.end > endPos) continue;
+                if (--budget <= 0) { cache.set(endPos, null); return null; }
+                if (body.substring(closing.end, endPos).trim()) continue;
+                for (const opening of openings) {
+                    if (opening.end > closing.start) continue;
+                    if (--budget <= 0) { cache.set(endPos, null); return null; }
+                    if (closing.start - opening.end > MAX_TOOL_ARGUMENT_CHARS) continue;
+                    const rest = solve(opening.start);
+                    if (rest) {
+                        result = rest.concat([{ opening, closing }]);
+                        break;
+                    }
+                }
+                if (result) break;
+            }
+        }
+        cache.set(endPos, result);
+        return result;
+    };
+    return solve(body.length);
+}
+
 function parseDsmlInvoke(name, body) {
     const structuralTags = scanDsmlStructuralTags(body);
     if (!structuralTags) return null;
-    const parameterTags = structuralTags.filter(tag => tag.name === 'parameter');
-    if (structuralTags.some(tag => tag.name !== 'parameter')) return null;
+    const openings = structuralTags
+        .filter(tag => tag.name === 'parameter' && !tag.closing && !tag.selfClosing)
+        .reverse();
+    const closings = structuralTags
+        .filter(tag => tag.name === 'parameter' && tag.closing)
+        .reverse();
 
+    if (openings.length === 0 && closings.length === 0) {
+        const decodedBody = decodeDsmlValue(body).trim();
+        if (!decodedBody) return buildToolCall(name, {});
+        const objects = extractBalancedJsonObjects(decodedBody, 2);
+        if (objects.length !== 1 || decodedBody !== objects[0]) return null;
+        try { return buildToolCall(name, parseJsonLenient(objects[0])); }
+        catch (e) { return null; }
+    }
+
+    const blocks = matchParameterBlocks(body, openings, closings);
+    if (!blocks || blocks.length === 0 || blocks.length > MAX_DSML_PARAMETERS) return null;
     const args = {};
-    let parameterCount = 0;
     const seenNames = new Set();
-    let cursor = 0;
-    for (let i = 0; i < parameterTags.length; i += 2) {
-        const opening = parameterTags[i];
-        const closing = parameterTags[i + 1];
-        if (!opening || opening.closing || opening.selfClosing || !closing || !closing.closing) return null;
-        if (body.substring(cursor, opening.start).trim()) return null;
-        parameterCount++;
-        if (parameterCount > MAX_DSML_PARAMETERS) return null;
-        if (!parseDsmlParameter(opening.attrs, body.substring(opening.end, closing.start), args, seenNames)) return null;
-        cursor = closing.end;
+    for (const block of blocks) {
+        if (!parseDsmlParameter(block.opening.attrs, body.substring(block.opening.end, block.closing.start), args, seenNames)) return null;
     }
-    if (parameterCount > 0) {
-        if (body.substring(cursor).trim()) return null;
-        return buildToolCall(name, args);
-    }
-
-    const decodedBody = decodeDsmlValue(body).trim();
-    if (!decodedBody) return buildToolCall(name, {});
-    const objects = extractBalancedJsonObjects(decodedBody, 2);
-    if (objects.length !== 1 || decodedBody !== objects[0]) return null;
-    try { return buildToolCall(name, parseJsonLenient(objects[0])); }
-    catch (e) { return null; }
+    return buildToolCall(name, args);
 }
 
 function extractToolCallScope(normalized) {
     const tags = scanDsmlStructuralTags(normalized);
     if (!tags) return null;
     const wrappers = tags.filter(tag => tag.name === 'tool_calls');
-    const openings = wrappers.filter(tag => !tag.closing);
+    const openings = wrappers.filter(tag => !tag.closing && !tag.selfClosing);
     const closings = wrappers.filter(tag => tag.closing);
     if (openings.length > 0) {
-        if (openings.length !== 1 || openings[0].selfClosing || closings.length === 0) return null;
         const opening = openings[0];
-        const closing = closings[closings.length - 1];
-        if (wrappers.some(tag => tag.closing && tag.start < opening.end) || closing.start < opening.end) return null;
-        if (tags.some(tag => tag.name !== 'tool_calls' && (tag.start < opening.end || tag.start >= closing.start))) return null;
-        return normalized.substring(opening.end, closing.start);
+        // The Web build regularly omits the closing wrapper while keeping the
+        // invoke complete. The opening wrapper is still an explicit call
+        // signal, so the scope may run to the end of the text — the invoke
+        // parser still requires a matching </invoke> with nothing after it.
+        const closing = closings.length > 0 ? closings[closings.length - 1] : null;
+        if (closing && closing.start < opening.end) return null;
+        // Structure outside the wrapper is never accepted. Anything inside is
+        // argument text until the invoke parser says otherwise.
+        if (wrappers.some(tag => tag.closing && tag.start < opening.end)) return null;
+        if (tags.some(tag => tag.name !== 'tool_calls' && tag.start < opening.end)) return null;
+        const scopeEnd = closing ? closing.start : normalized.length;
+        if (closing && tags.some(tag => tag.name !== 'tool_calls' && tag.start >= scopeEnd)) return null;
+        return normalized.substring(opening.end, scopeEnd);
     }
     // Narrow repair: tolerate a missing opening wrapper only when a closing
     // wrapper exists. A bare invoke without this sentinel is never executable.
     if (closings.length > 0) {
         const closing = closings[closings.length - 1];
-        const invokeOpenings = tags.filter(tag => tag.name === 'invoke' && !tag.closing && tag.start < closing.start);
-        if (invokeOpenings.length === 1 && !invokeOpenings[0].selfClosing) {
-            if (tags.some(tag => tag.name !== 'tool_calls' && (tag.start < invokeOpenings[0].start || tag.start >= closing.start))) return null;
-            return normalized.substring(invokeOpenings[0].start, closing.start);
+        const invokeOpenings = tags.filter(tag => tag.name === 'invoke' && !tag.closing && !tag.selfClosing && tag.start < closing.start);
+        if (invokeOpenings.length > 0) {
+            const first = invokeOpenings[0];
+            if (tags.some(tag => tag.name !== 'tool_calls' && (tag.start < first.start || tag.start >= closing.start))) return null;
+            return normalized.substring(first.start, closing.start);
         }
     }
     return null;
 }
 
-function parseDsmlToolCall(text) {
+// One wrapper may carry several invokes (parallel tool calls); the Web build
+// emits that often for multi-query searches. Blocks are matched in order and
+// the text between them must be whitespace only.
+function splitInvocations(scope, openings, closings) {
+    const results = [];
+    let cursor = 0;
+    for (const opening of openings) {
+        if (opening.start < cursor) continue;
+        if (scope.substring(cursor, opening.start).trim()) return null;
+        const closing = closings.find(tag => tag.start >= opening.end);
+        if (!closing) return null;
+        const parsed = parseDsmlInvoke(getMarkupAttribute(opening.attrs, 'name'), scope.substring(opening.end, closing.start));
+        if (!parsed) return null;
+        results.push(parsed);
+        if (results.length > MAX_PARALLEL_TOOL_CALLS) return null;
+        cursor = closing.end;
+    }
+    if (!results.length || scope.substring(cursor).trim()) return null;
+    return results;
+}
+
+// True when the text carries a complete, parsable invoke block. Used to tell
+// "a later parallel call was swallowed into the first argument" apart from
+// "the argument merely quotes DSML-looking markup".
+function containsParsableInvoke(body) {
+    const tags = scanDsmlStructuralTags(body);
+    if (!tags) return false;
+    for (const opening of tags) {
+        if (opening.name !== 'invoke' || opening.closing || opening.selfClosing) continue;
+        const closing = tags.find(tag => tag.name === 'invoke' && tag.closing && tag.start >= opening.end);
+        if (!closing) continue;
+        if (parseDsmlInvoke(getMarkupAttribute(opening.attrs, 'name'), body.substring(opening.end, closing.start))) return true;
+    }
+    return false;
+}
+
+function parseDsmlToolCalls(text) {
     if (String(text || '').length > MAX_TOOL_MARKUP_CHARS) return null;
     const normalized = normalizeToolMarkupTags(text);
     const scope = extractToolCallScope(normalized);
@@ -1453,27 +1568,47 @@ function parseDsmlToolCall(text) {
     if (scope.substring(0, first.start).trim()) return null;
 
     if (first.name === 'invoke' && !first.closing && !first.selfClosing) {
-        const invokeTags = tags.filter(tag => tag.name === 'invoke');
-        if (invokeTags.length !== 2 || invokeTags[0] !== first || invokeTags[1].closing !== true) return null;
-        const closing = invokeTags[1];
-        if (scope.substring(closing.end).trim()) return null;
-        if (tags.some(tag => (tag.name === 'tool_calls' || tag.name === 'direct'))) return null;
-        const parsed = parseDsmlInvoke(getMarkupAttribute(first.attrs, 'name'), scope.substring(first.end, closing.start));
-        if (parsed) {
-            console.log(`[parseToolCall] SUCCESS dsml: ${parsed.name} (args=${parsed.arguments.length} chars)`);
-            return parsed;
+        const closers = tags.filter(tag => tag.name === 'invoke' && tag.closing);
+        const openings = tags.filter(tag => tag.name === 'invoke' && !tag.closing && !tag.selfClosing);
+        // Block splitting comes first: with several invokes the single-call
+        // path would swallow the later blocks into the first argument value.
+        const blocks = splitInvocations(scope, openings, closers);
+        if (blocks) {
+            const label = blocks.length > 1 ? 'dsml-parallel' : 'dsml';
+            console.log(`[parseToolCall] SUCCESS ${label}: ${blocks.map(tc => tc.name).join(', ')} (args=${blocks.map(tc => tc.arguments.length).join('/')} chars)`);
+            return blocks;
         }
+        // Fallback for one invoke whose argument quotes "</invoke>": there the
+        // real closing tag is the last one, so the ordered split fails. The
+        // body must not contain a parseable invoke of its own, otherwise the
+        // single-call path would silently drop a parallel call.
+        const closing = closers.length > 0 ? closers[closers.length - 1] : null;
+        if (closing && closing.start >= first.end && !scope.substring(closing.end).trim()) {
+            const body = scope.substring(first.end, closing.start);
+            if (!containsParsableInvoke(body)) {
+                const parsed = parseDsmlInvoke(getMarkupAttribute(first.attrs, 'name'), body);
+                if (parsed) {
+                    console.log(`[parseToolCall] SUCCESS dsml: ${parsed.name} (args=${parsed.arguments.length} chars)`);
+                    return [parsed];
+                }
+            }
+        }
+        return null;
     }
 
     if (first.name === 'direct' && !first.closing && !first.selfClosing) {
-        if (tags.some((tag, index) => index > 0 && (tag.name === 'direct' || tag.name === 'invoke' || tag.name === 'tool_calls'))) return null;
         const parsed = parseDsmlInvoke(getMarkupAttribute(first.attrs, 'name'), scope.substring(first.end));
         if (parsed) {
             console.log(`[parseToolCall] SUCCESS dsml-direct: ${parsed.name} (args=${parsed.arguments.length} chars)`);
-            return parsed;
+            return [parsed];
         }
     }
     return null;
+}
+
+function parseDsmlToolCall(text) {
+    const calls = parseDsmlToolCalls(text);
+    return calls && calls.length > 0 ? calls[0] : null;
 }
 
 function looksLikeToolCallMarkup(rawText) {
@@ -1494,23 +1629,44 @@ function stripForeignCodeFences(text) {
     return String(text || '').replace(new RegExp(CODE_FENCE_RE.source, 'g'), (whole, ticks, language) => (isJsonFenceLanguage(language) ? whole : '\n'));
 }
 
-function parseToolCall(text) {
-    if (!text || typeof text !== 'string') return null;
+// Ranges of the raw text covered by a code fence. Used to tell a documented
+// example apart from a real envelope when the argument itself quotes fences.
+function codeFenceRanges(text) {
+    const ranges = [];
+    const fenceRe = new RegExp(CODE_FENCE_RE.source, 'g');
+    let fence;
+    while ((fence = fenceRe.exec(String(text || ''))) !== null) {
+        ranges.push({ start: fence.index, end: fence.index + fence[0].length });
+        if (fence[0].length === 0) fenceRe.lastIndex++;
+    }
+    return ranges;
+}
+
+function parseToolCalls(text) {
+    if (!text || typeof text !== 'string') return [];
     if (text.length > MAX_TOOL_MARKUP_CHARS) {
         console.log(`[parseToolCall] Refusing oversized tool markup candidate (${text.length} chars)`);
-        return null;
+        return [];
     }
 
     // Code blocks in another language (```csharp, ```javascript, ```xml ...)
     // are source code. Tool-call examples inside them must never execute, so
     // all searches except the JSON-fence one run on the text without them.
     const scanText = stripForeignCodeFences(text);
+    const dsmlMarkerRe = /[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i;
 
-    if (/[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i.test(scanText)) {
-        const dsml = parseDsmlToolCall(scanText);
+    if (dsmlMarkerRe.test(scanText)) {
+        // The markup itself is read from the raw text: a DSML argument is
+        // allowed to quote Markdown fences, and stripping those first would
+        // silently empty the argument. Only a marker that OPENS inside a
+        // fence (a documented ```xml example) is ignored.
+        const markerOffset = text.search(dsmlMarkerRe);
+        const markerFenced = markerOffset !== -1
+            && codeFenceRanges(text).some(range => markerOffset >= range.start && markerOffset < range.end);
+        const dsml = markerFenced ? null : parseDsmlToolCalls(text);
         if (dsml) return dsml;
         console.log('[parseToolCall] Tool markup found but wrapper/invoke was incomplete or malformed');
-        return null;
+        return [];
     }
 
     // XML-ish wrappers used by some agent prompts.
@@ -1524,7 +1680,7 @@ function parseToolCall(text) {
             const object = objectStart === -1 ? null : extractBalancedJsonAt(inner, objectStart);
             if (object && object !== inner) tc = parseJsonToolCandidate(object, 'xml-object', { allowBare: true });
         }
-        if (tc) return tc;
+        if (tc) return [tc];
     }
 
     // Fenced JSON blocks (untagged or tagged json).
@@ -1535,7 +1691,7 @@ function parseToolCall(text) {
         const body = fence[3].trim();
         if (!body.startsWith('{')) continue;
         const tc = parseJsonToolCandidate(body, 'fenced');
-        if (tc) return tc;
+        if (tc) return [tc];
     }
 
     // Legacy TOOL_CALL: name + first balanced JSON object after it.
@@ -1552,7 +1708,7 @@ function parseToolCall(text) {
                     const tc = buildToolCall(name, args);
                     if (tc) {
                         console.log(`[parseToolCall] SUCCESS legacy: ${name} (args=${rawJson.length} chars)`);
-                        return tc;
+                        return [tc];
                     }
                 } catch (e) {
                     console.log(`[parseToolCall] legacy JSON.parse failed: ${e.message.substring(0,100)}`);
@@ -1565,16 +1721,51 @@ function parseToolCall(text) {
         }
     }
 
+    // A JSON envelope must be read from the raw text first: tool arguments
+    // often quote Markdown fences (documentation templates), and stripping
+    // those before parsing would corrupt the JSON we are trying to read.
+    // Candidates that START inside a fence stay excluded, so an example
+    // written inside ```javascript is still never executed.
+    const rawEnvelopes = extractBalancedJsonObjects(text, MAX_TOOL_JSON_CANDIDATES, object => TOOL_ENVELOPE_KEY_RE.test(object));
+    if (rawEnvelopes.length > 0) {
+        const fences = codeFenceRanges(text);
+        for (const rawJson of rawEnvelopes) {
+            const offset = text.indexOf(rawJson);
+            if (offset !== -1 && fences.some(range => offset >= range.start && offset < range.end)) continue;
+            const tc = parseJsonToolCandidate(rawJson, 'inline-raw');
+            if (tc) return [tc];
+        }
+    }
+
     // Scan each top-level balanced object once (linear time). Only explicit
     // top-level tool-call envelopes are executable; bare {name, arguments}
     // examples and envelopes nested inside other JSON are not.
     for (const rawJson of extractBalancedJsonObjects(scanText, MAX_TOOL_JSON_CANDIDATES, object => TOOL_ENVELOPE_KEY_RE.test(object))) {
         const tc = parseJsonToolCandidate(rawJson, 'inline');
-        if (tc) return tc;
+        if (tc) return [tc];
+    }
+
+    // A pure JSON envelope that lost only its final brace (the usual shape of
+    // an answer cut off at the output limit) is still executable: the tree
+    // itself is complete, so every argument value survived.
+    const closedRoot = closeMissingRootBrace(text);
+    if (closedRoot && TOOL_ENVELOPE_KEY_RE.test(closedRoot)) {
+        const braceOffset = text.length - text.trimStart().length;
+        const fenced = codeFenceRanges(text).some(range => braceOffset >= range.start && braceOffset < range.end);
+        if (!fenced) {
+            const tc = parseJsonToolCandidate(closedRoot, 'inline-repaired-brace');
+            if (tc) return [tc];
+        }
     }
 
     console.log(`[parseToolCall] No tool call match in ${text.length} chars`);
-    return null;
+    return [];
+}
+
+// Single-call helper kept for callers (and tests) that only need one call.
+function parseToolCall(text) {
+    const calls = parseToolCalls(text);
+    return calls.length > 0 ? calls[0] : null;
 }
 
 /**
@@ -1589,6 +1780,39 @@ function sanitizeContent(text) {
 
 function estimateTokens(text) {
     return text ? Math.ceil(String(text).length / 4) : 0;
+}
+
+// A malformed tool-call response can only be diagnosed from its raw text, so
+// keep the failing answers on disk (bounded to the newest few). Set
+// PARSE_FAILURE_DUMP=0 to disable.
+const PARSE_FAILURE_DIR = path.join(__dirname, 'logs', 'parse-failures');
+const PARSE_FAILURE_KEEP = 50;
+
+function dumpParseFailure(label, text, meta = {}) {
+    if (String(process.env.PARSE_FAILURE_DUMP || '') === '0') return null;
+    if (typeof text !== 'string' || !text) return null;
+    try {
+        fs.mkdirSync(PARSE_FAILURE_DIR, { recursive: true });
+        const hash = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
+        const file = path.join(PARSE_FAILURE_DIR, `${Date.now()}-${label}-${hash}.txt`);
+        const header = [
+            `label: ${label}`,
+            `chars: ${text.length}`,
+            `sha1: ${hash}`,
+            ...Object.entries(meta).map(([key, value]) => `${key}: ${value}`),
+            '---- raw response follows ----',
+            '',
+        ].join('\n');
+        fs.writeFileSync(file, header + text, 'utf8');
+        const kept = fs.readdirSync(PARSE_FAILURE_DIR).filter(name => name.endsWith('.txt')).sort();
+        for (const stale of kept.slice(0, Math.max(0, kept.length - PARSE_FAILURE_KEEP))) {
+            try { fs.unlinkSync(path.join(PARSE_FAILURE_DIR, stale)); } catch (e) { /* best effort */ }
+        }
+        return file;
+    } catch (e) {
+        console.log(`[parseToolCall] Could not dump malformed response: ${e.message}`);
+        return null;
+    }
 }
 
 function buildUsage(prompt, content, reasoningContent = '') {
@@ -1606,16 +1830,17 @@ function buildUsage(prompt, content, reasoningContent = '') {
     };
 }
 
-function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = '', reasoningContent = '') {
-    const id = 'call_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+function buildToolCallResponse(toolCalls, model = 'deepseek-default', prompt = '', reasoningContent = '') {
+    const list = Array.isArray(toolCalls) ? toolCalls : [toolCalls];
+    const stamp = Date.now();
     const message = {
         role: 'assistant',
         content: null,
-        tool_calls: [{
-            id: id,
+        tool_calls: list.map((toolCall, index) => ({
+            id: `call_${stamp}_${index}_${Math.random().toString(36).substring(2, 8)}`,
             type: 'function',
             function: { name: toolCall.name, arguments: toolCall.arguments }
-        }]
+        }))
     };
     // Do not attach reasoning to tool-call turns. Some agent clients treat any
     // reasoning/text payload as a final assistant answer and stop their tool loop.
@@ -2235,10 +2460,13 @@ function sendAnthropicStream(res, openaiResp) { sendStreamedCompletion(res, 'ant
 function sendResponsesStream(res, openaiResp) { sendStreamedCompletion(res, 'responses', openaiResp); }
 function sendOpenAIStream(res, openaiResp) { sendStreamedCompletion(res, 'openai', openaiResp); }
 
-function storeHistory(session, prompt, content, toolCall) {
-    const assistantResponse = toolCall
-        ? toolCallAsPromptText({ function: toolCall })
-        : content;
+function storeHistory(session, prompt, content, toolCalls) {
+    const list = Array.isArray(toolCalls) ? toolCalls : (toolCalls ? [toolCalls] : []);
+    // A single call keeps the original {tool_call:{...}} shape so recovery
+    // history stays byte-identical for the common case.
+    const assistantResponse = list.length === 0
+        ? content
+        : (list.length === 1 ? toolCallAsPromptText({ function: list[0] }) : toolCallAsPromptText(list));
     // Save last 500 chars of the prompt for history context
     const shortPrompt = prompt.length > 500 ? '...' + prompt.substring(prompt.length - 500) : prompt;
     // One huge answer must not crowd every earlier turn out of the bounded
@@ -2436,12 +2664,16 @@ function isSystemRole(role) {
 // Earlier tool requests are replayed in the same JSON envelope the model is
 // asked to produce, so the transcript never teaches it a second format.
 function toolCallAsPromptText(toolCall) {
-    const name = toolCall?.function?.name || toolCall?.name || '';
-    let args = toolCall?.function?.arguments ?? toolCall?.arguments ?? {};
-    if (typeof args === 'string') {
-        try { args = JSON.parse(args || '{}'); } catch (e) { /* keep the raw string */ }
-    }
-    return JSON.stringify({ tool_call: { name, arguments: args } });
+    const one = (call) => {
+        const name = call?.function?.name || call?.name || '';
+        let args = call?.function?.arguments ?? call?.arguments ?? {};
+        if (typeof args === 'string') {
+            try { args = JSON.parse(args || '{}'); } catch (e) { /* keep the raw string */ }
+        }
+        return { name, arguments: args };
+    };
+    if (Array.isArray(toolCall)) return JSON.stringify({ tool_calls: toolCall.map(one) });
+    return JSON.stringify({ tool_call: one(toolCall) });
 }
 
 function buildToolNameIndex(messages) {
@@ -3197,32 +3429,41 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            let toolCall = allowedToolNames.size > 0 ? parseToolCall(fullContent) : null;
-            if (toolCall && !allowedToolNames.has(toolCall.name)) {
-                console.log(`${agentTag} Model requested unknown tool ${toolCall.name}; attempting format repair.`);
-                toolCall = null;
+            let toolCalls = allowedToolNames.size > 0 ? parseToolCalls(fullContent) : [];
+            const unknownTool = toolCalls.find(tc => !allowedToolNames.has(tc.name));
+            if (unknownTool) {
+                console.log(`${agentTag} Model requested unknown tool ${unknownTool.name}; attempting format repair.`);
+                toolCalls = [];
             }
 
             // Retry once if legacy, XML, or DSML tool markup was truncated or
             // malformed. Never pass raw DSML through as a normal assistant turn.
-            if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
+            let firstDump = null;
+            let retryDump = null;
+            if (allowedToolNames.size > 0 && toolCalls.length === 0 && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
                 console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
+                firstDump = dumpParseFailure('first', fullContent, {
+                    agent: agentId,
+                    model: requestedModel,
+                    finish_reason: finishReason,
+                });
+                if (firstDump) console.log(`${agentTag} Malformed response saved to ${firstDump}`);
                 resetRemoteSession(session);
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = appendPromptInstruction(
                     freshPromptBuild.prompt,
-                    `[STRICT INSTRUCTION] Your previous response contained incomplete or invalid tool-call markup. Keep arguments short and output ONLY strict JSON: ${TOOL_CALL_FORMAT} (escape backslashes and newlines inside strings). Available tools: ${[...allowedToolNames].join(', ').substring(0, 1500)}`
+                    `[STRICT INSTRUCTION] Your previous response contained incomplete or invalid tool-call markup. Keep arguments short and output ONLY strict JSON: ${TOOL_CALL_FORMAT} (escape backslashes and newlines inside strings, close every brace, and never put raw "<" markup inside argument values). Exactly one complete tool call, no wrapper tags, no Markdown; if several tools are needed, emit one now and wait for its result. Available tools: ${[...allowedToolNames].join(', ').substring(0, 1500)}`
                 );
                 const retryCall2 = await callDeepSeek(strictPrompt);
                 const retryResult2 = await readDeepSeekResponse(retryCall2);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
-                    const retryTc = parseToolCall(retryContent2);
-                    if (retryTc && allowedToolNames.has(retryTc.name)) {
-                        console.log(`${agentTag} Retry with strict prompt succeeded: ${retryTc.name}`);
+                    const retryCalls = parseToolCalls(retryContent2).filter(tc => allowedToolNames.has(tc.name));
+                    if (retryCalls.length > 0) {
+                        console.log(`${agentTag} Retry with strict prompt succeeded: ${retryCalls.map(tc => tc.name).join(', ')}`);
                         fullContent = retryContent2;
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
-                        toolCall = retryTc;
+                        toolCalls = retryCalls;
                     } else if (!looksLikeToolCallMarkup(retryContent2)) {
                         // The model chose to answer in plain text this time.
                         console.log(`${agentTag} Strict retry returned a plain answer instead of tool markup.`);
@@ -3231,13 +3472,24 @@ const server = http.createServer(async (req, res) => {
                         finishReason = retryResult2.finishReason;
                     } else {
                         console.log(`${agentTag} Retry still has broken tool markup. Returning a safe error instead of leaking it as text.`);
+                        retryDump = dumpParseFailure('retry', retryContent2, {
+                            agent: agentId,
+                            model: requestedModel,
+                            finish_reason: retryResult2.finishReason,
+                        });
+                        if (retryDump) console.log(`${agentTag} Malformed retry saved to ${retryDump}`);
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
                     }
                 }
             }
 
-            if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
+            if (allowedToolNames.size > 0 && toolCalls.length === 0 && looksLikeToolCallMarkup(fullContent)) {
                 const failure = resetRemoteSession(session);
+                const dumpFile = retryDump || firstDump || dumpParseFailure('final', fullContent, {
+                    agent: agentId,
+                    model: requestedModel,
+                    finish_reason: finishReason,
+                });
                 respondError(502, {
                     message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
                     type: 'malformed_tool_call',
@@ -3249,6 +3501,7 @@ const server = http.createServer(async (req, res) => {
                     prompt_compacted: promptCompacted,
                     model: requestedModel,
                     real_model: resolveModelConfig(requestedModel).real_model,
+                    dump_file: dumpFile || undefined,
                 });
                 return;
             }
@@ -3256,7 +3509,7 @@ const server = http.createServer(async (req, res) => {
             // Check if tool results of the current turn contained a screenshot path.
             // If so, and the response doesn't already have MEDIA:, inject it so the gateway
             // delivers the file to Telegram.
-            if (!toolCall && !fullContent.includes('MEDIA:')) {
+            if (toolCalls.length === 0 && !fullContent.includes('MEDIA:')) {
                 const screenshotPaths = extractScreenshotPaths(messages);
                 if (screenshotPaths.length > 0) {
                     fullContent += '\n\n' + screenshotPaths.join('\n');
@@ -3271,7 +3524,7 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} client disconnected before the answer was sent; discarding it`);
                 return;
             }
-            if (!ephemeral) storeHistory(agentSession, prompt, fullContent, toolCall);
+            if (!ephemeral) storeHistory(agentSession, prompt, fullContent, toolCalls);
             // Remember what the remote chat now holds, so the next request of
             // this conversation sends only its new messages.
             if (session.id) {
@@ -3279,13 +3532,13 @@ const server = http.createServer(async (req, res) => {
                 session.contextKey = contextKey;
             }
 
-            const openaiResponse = toolCall
-                ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)
+            const openaiResponse = toolCalls.length > 0
+                ? buildToolCallResponse(toolCalls, requestedModel, clientPromptText, reasoningContent)
                 : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason);
 
             if (live) live.finish(openaiResponse);
             else sendCompletion(res, apiMode, false, openaiResponse);
-            console.log(`${agentTag} ${stream ? 'Streamed' : 'Response'} ${apiMode} (tool=${!!toolCall}, ${Date.now() - startTime}ms, ${fullContent.length} chars)`);
+            console.log(`${agentTag} ${stream ? 'Streamed' : 'Response'} ${apiMode} (tool=${toolCalls.length > 0}, ${Date.now() - startTime}ms, ${fullContent.length} chars)`);
         } catch (e) {
             console.log('[DS-API] Error:', e.message);
             // If DeepSeek accepted a completion, the remote chat may now hold a
@@ -3426,7 +3679,12 @@ module.exports = {
         compactToolSchema,
         formatToolDefinitions,
         parseToolCall,
+        parseToolCalls,
         parseDsmlToolCall,
+        parseDsmlToolCalls,
+        buildToolCallResponse,
+        toolCallAsPromptText,
+        dumpParseFailure,
         looksLikeToolCallMarkup,
         truncatePromptMiddle,
         hasExplicitConversationHistory,

@@ -7,10 +7,15 @@ deepseek-auth.json
 deepseek-accounts.json
 # Runtime-added auth files contain secrets — keep the dir, ignore its contents.
 data/accounts/*.json
+accounts/
+# Local agent notes and runtime state, never shared.
+.workbuddy/
 .chrome-profile-deepseek/
 .chrome-for-testing-profile-deepseek/
 .chrome-for-testing-profile-deepseek.stale-*/
 *.session.json
 /tmp/deepseek_response_*
+# Raw malformed tool-call responses kept for diagnosis (may contain user data).
+logs/
 .DS_Store
 *.pdf

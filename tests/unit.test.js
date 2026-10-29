@@ -413,7 +413,6 @@ test('parseToolCall rejects partially consumed DSML parameters and wrapper scope
   const truncatedSecondParameter = '<tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter><parameter name="content">truncated</invoke></tool_calls>';
   const trailingInvokeJunk = '<tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter>GARBAGE</invoke></tool_calls>';
   const truncatedSecondInvoke = '<tool_calls><invoke name="ping"></invoke><invoke name="write_file"><parameter name="path">/tmp/a</tool_calls>';
-  const twoCompleteInvokes = '<tool_calls><invoke name="ping"></invoke><invoke name="ping"></invoke></tool_calls>';
   const secondInvokeOutsideWrapper = '<tool_calls><invoke name="ping"></invoke></tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter></invoke>';
   const trailingWrapperJunk = '<tool_calls><invoke name="ping"></invoke>GARBAGE</tool_calls>';
   const unclosedCdata = '<tool_calls><invoke name="write_file"><parameter name="content"><![CDATA[truncated</parameter></invoke></tool_calls>';
@@ -423,7 +422,6 @@ test('parseToolCall rejects partially consumed DSML parameters and wrapper scope
     truncatedSecondParameter,
     trailingInvokeJunk,
     truncatedSecondInvoke,
-    twoCompleteInvokes,
     secondInvokeOutsideWrapper,
     trailingWrapperJunk,
     unclosedCdata,
@@ -431,6 +429,140 @@ test('parseToolCall rejects partially consumed DSML parameters and wrapper scope
   ]) {
     assert.equal(serverInternals.parseToolCall(malformed), null, malformed);
     assert.equal(serverInternals.looksLikeToolCallMarkup(malformed), true, malformed);
+  }
+});
+
+test('parseToolCalls returns every invoke of a parallel tool turn', () => {
+  const parallel = [
+    '<｜｜DSML｜｜ calls>',
+    '<｜｜DSML｜｜ invoke name="WebSearch"><｜｜DSML｜｜ parameter name="query" string="true">甲</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>',
+    '<｜｜DSML｜｜ invoke name="WebSearch"><｜｜DSML｜｜ parameter name="query" string="true">乙</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>',
+    '</｜｜DSML｜｜ calls>',
+  ].join('\n');
+  const calls = serverInternals.parseToolCalls(parallel);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(c => JSON.parse(c.arguments).query), ['甲', '乙']);
+  assert.equal(serverInternals.parseToolCall(parallel).name, 'WebSearch');
+
+  // Blocks separated by non-whitespace are still rejected.
+  const glued = '<tool_calls><invoke name="a"></invoke>junk<invoke name="b"></invoke></tool_calls>';
+  assert.deepEqual(serverInternals.parseToolCalls(glued), []);
+
+  // The single-call path keeps working when an argument quotes </invoke>.
+  const quoted = '<tool_calls><invoke name="write_file"><parameter name="content">a </invoke> b</parameter></invoke></tool_calls>';
+  const single = serverInternals.parseToolCalls(quoted);
+  assert.equal(single.length, 1);
+  assert.equal(JSON.parse(single[0].arguments).content, 'a </invoke> b');
+});
+
+test('parseToolCall keeps markup quoted inside an argument value', () => {
+  // Coding agents routinely pass templates/XML fixtures that mention tags the
+  // DSML scanner recognises. Those are argument text, not structure.
+  const cases = [
+    ['<tool_calls><invoke name="write_file"><parameter name="content">tpl = "<invoke name=x>hi</invoke>"</parameter></invoke></tool_calls>',
+      'tpl = "<invoke name=x>hi</invoke>"'],
+    ['<tool_calls><invoke name="write_file"><parameter name="content">if (line == "</parameter>") break;</parameter></invoke></tool_calls>',
+      'if (line == "</parameter>") break;'],
+    ['<tool_calls><invoke name="write_file"><parameter name="content">x <tool_calls> y</parameter></invoke></tool_calls>',
+      'x <tool_calls> y'],
+    ['<tool_calls><invoke name="write_file"><parameter name="content">x <direct name="z"> y</parameter></invoke></tool_calls>',
+      'x <direct name="z"> y'],
+  ];
+  for (const [markup, expected] of cases) {
+    const call = serverInternals.parseToolCall(markup);
+    assert.ok(call, markup);
+    assert.equal(JSON.parse(call.arguments).content, expected, markup);
+  }
+
+  // Quoted markup must not weaken the structural rejections.
+  assert.deepEqual(serverInternals.parseToolCalls('<tool_calls><invoke name="a"></invoke>junk</tool_calls>'), []);
+  assert.equal(serverInternals.parseToolCall('<tool_calls><invoke name="a"><parameter name="p">v</parameter></invoke>junk</tool_calls>'), null);
+});
+
+test('quoted markup inside argument values stays bounded', () => {
+  const quoted = '<tool_calls><invoke name="write_file"><parameter name="content">' + '</parameter>x'.repeat(500) + '</parameter></invoke></tool_calls>';
+  const started = Date.now();
+  const call = serverInternals.parseToolCall(quoted);
+  assert.ok(call, 'a long quoted closing tag must still parse');
+  assert.equal(JSON.parse(call.arguments).content, '</parameter>x'.repeat(500));
+  assert.ok(Date.now() - started < 1000);
+
+  const pathological = '<tool_calls><invoke name="write_file"><parameter name="content">' + '</parameter>x'.repeat(3000);
+  const pathologicalStarted = Date.now();
+  assert.equal(serverInternals.parseToolCall(pathological), null);
+  assert.ok(Date.now() - pathologicalStarted < 1000, 'unbalanced quoted markup must fail fast');
+});
+
+test('Web DSML "calls" wrapper and Markdown fences inside arguments both survive', () => {
+  const web = [
+    '<｜｜DSML｜｜ calls>',
+    '<｜｜DSML｜｜ invoke name="Write">',
+    '<｜｜DSML｜｜ parameter name="file_path" string="true">/tmp/a.md</｜｜DSML｜｜ parameter>',
+    '<｜｜DSML｜｜ parameter name="content" string="true">```bash\nnpm i\n```</｜｜DSML｜｜ parameter>',
+    '</｜｜DSML｜｜ invoke>',
+    '</｜｜DSML｜｜ calls>',
+  ].join('\n');
+  const call = serverInternals.parseToolCall(web);
+  assert.ok(call, 'the bare "calls" wrapper must be recognised');
+  assert.equal(call.name, 'Write');
+  assert.deepEqual(JSON.parse(call.arguments), { file_path: '/tmp/a.md', content: '```bash\nnpm i\n```' });
+});
+
+test('a JSON envelope quoting Markdown fences is read from the raw text', () => {
+  const envelope = JSON.stringify({
+    tool_call: {
+      name: 'Write',
+      arguments: { file_path: '/tmp/b.md', content: '# 标题\n\n```bash\nnpm i\n```\n\n```json\n{"a":1}\n```\n' },
+    },
+  });
+  const call = serverInternals.parseToolCall(envelope);
+  assert.equal(call.name, 'Write');
+  assert.equal(JSON.parse(call.arguments).content, '# 标题\n\n```bash\nnpm i\n```\n\n```json\n{"a":1}\n```\n');
+
+  // The same envelope quoted inside a foreign fence is documentation.
+  assert.equal(serverInternals.parseToolCall('```javascript\nconst x = ' + envelope + ';\n```'), null);
+});
+
+test('an envelope missing only its root brace is repaired, a truncated string is not', () => {
+  const full = '{"tool_call":{"name":"Write","arguments":{"path":"/tmp/c","content":"hi"}}}';
+  const repaired = serverInternals.parseToolCall(full.slice(0, -1));
+  assert.deepEqual(JSON.parse(repaired.arguments), { path: '/tmp/c', content: 'hi' });
+
+  assert.equal(serverInternals.parseToolCall('{"tool_call":{"name":"Write","arguments":{"path":"/tmp'), null);
+  assert.equal(serverInternals.parseToolCall('```javascript\n' + full.slice(0, -1) + '\n```'), null);
+});
+
+test('parallel calls become one assistant turn with two tool_calls', () => {
+  const calls = [
+    { name: 'WebSearch', arguments: '{"query":"a"}' },
+    { name: 'WebSearch', arguments: '{"query":"b"}' },
+  ];
+  const response = serverInternals.buildToolCallResponse(calls, 'deepseek-chat', 'p');
+  const toolCalls = response.choices[0].message.tool_calls;
+  assert.equal(toolCalls.length, 2);
+  assert.notEqual(toolCalls[0].id, toolCalls[1].id);
+  assert.deepEqual(toolCalls.map(tc => tc.function.arguments), ['{"query":"a"}', '{"query":"b"}']);
+  assert.equal(response.choices[0].finish_reason, 'tool_calls');
+
+  // History keeps the original single-call shape and lists parallel calls.
+  assert.match(serverInternals.toolCallAsPromptText({ function: calls[0] }), /^\{"tool_call":/);
+  assert.match(serverInternals.toolCallAsPromptText(calls), /^\{"tool_calls":\[/);
+});
+
+test('malformed tool-call responses are dumped for diagnosis', () => {
+  const file = serverInternals.dumpParseFailure('unit-test', '<tool_calls>broken', { agent: 'unit' });
+  assert.ok(file, 'dump should create a file');
+  const saved = fs.readFileSync(file, 'utf8');
+  assert.match(saved, /label: unit-test/);
+  assert.match(saved, /agent: unit/);
+  assert.ok(saved.endsWith('<tool_calls>broken'));
+  fs.unlinkSync(file);
+
+  process.env.PARSE_FAILURE_DUMP = '0';
+  try {
+    assert.equal(serverInternals.dumpParseFailure('unit-test-off', 'x'), null);
+  } finally {
+    delete process.env.PARSE_FAILURE_DUMP;
   }
 });
 
