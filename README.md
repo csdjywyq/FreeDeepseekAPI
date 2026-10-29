@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ForgetMeAI/FreeDeepseekAPI/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
+  <a href="https://github.com/csdjywyq/FreeDeepseekAPI/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
   <img alt="Node.js 18 plus" src="https://img.shields.io/badge/node-18%2B-339933.svg" />
   <img alt="No npm dependencies" src="https://img.shields.io/badge/dependencies-0-blue.svg" />
   <img alt="OpenAI compatible" src="https://img.shields.io/badge/OpenAI-compatible-111111.svg" />
@@ -89,7 +89,7 @@ ForgetMeAI: https://t.me/forgetmeai
 ## ⚡ 快速开始
 
 ```bash
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/csdjywyq/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 npm run auth
 npm start
@@ -150,7 +150,7 @@ HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
 ## 🪟 Windows 启动
 
 ```powershell
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/csdjywyq/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 npm run auth
 npm start
@@ -171,7 +171,7 @@ npm run auth
 ## 🐧 Linux / Chromium 启动
 
 ```bash
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/csdjywyq/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 CHROME_PATH=$(which chromium) npm run auth
 npm start
@@ -234,7 +234,7 @@ DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
 ```bash
 # 1. 用户与代码
 sudo useradd --system --home /opt/FreeDeepseekAPI --shell /usr/sbin/nologin freedeepseek
-sudo git clone https://github.com/ForgetMeAI/FreeDeepseekAPI /opt/FreeDeepseekAPI
+sudo git clone https://github.com/csdjywyq/FreeDeepseekAPI /opt/FreeDeepseekAPI
 
 # 2. 密钥：在家用电脑上执行 `npm run auth` 得到的授权文件，以及客户端密钥
 sudo install -d -m 0750 -o root -g freedeepseek /etc/free-deepseek-api
