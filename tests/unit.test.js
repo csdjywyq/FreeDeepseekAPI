@@ -524,6 +524,7 @@ test('client-provided multi-turn history suppresses server recovery-history inje
 });
 
 test('context-too-long detector recognizes DeepSeek localized errors', () => {
+  // 俄文为 DeepSeek 上游本地化报错原文样本，用于验证识别逻辑，故保留原文。
   assert.equal(serverInternals.isContextTooLongError({ content: 'Содержание слишком длинное. Сократите его и попробуйте снова.' }), true);
   assert.equal(serverInternals.isContextTooLongError({ content: 'Maximum context length exceeded' }), true);
   assert.equal(serverInternals.isContextTooLongError({ content: 'Temporary backend overload' }), false);
@@ -896,6 +897,7 @@ test('image uploads default on and retain the explicit zero opt-out', () => {
 });
 
 test('rate-limit detector recognizes DeepSeek throttling messages', () => {
+  // 俄文样本同上：模拟上游本地化的限流与超长报错原文。
   assert.equal(serverInternals.isRateLimitError({ content: 'Too many messages in a short period' }), true);
   assert.equal(serverInternals.isRateLimitError({ content: 'Слишком частые сообщения. Повторите попытку позже.' }), true);
   assert.equal(serverInternals.isRateLimitError('rate_limit_reached'), true);

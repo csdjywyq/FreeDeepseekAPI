@@ -491,13 +491,13 @@ async function main() {
     await cdp.send('Network.enable');
 
     console.log(
-        '\n[auth] Chrome открыт. Войди в DeepSeek в ЭТОМ отдельном окне.',
+        '\n[auth] Chrome 已打开。请在这个独立窗口中登录 DeepSeek。',
     );
     console.log(
-        '[auth] После логина отправь в DeepSeek короткое сообщение, например: ok',
+        '[auth] 登录后，向 DeepSeek 发送一条短消息，例如：ok',
     );
     await ask(
-        '[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ',
+        '[auth] 完成登录并发送测试消息后，在此按 ENTER：',
     );
 
     let auth = null;

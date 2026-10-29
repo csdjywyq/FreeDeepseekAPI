@@ -25,14 +25,14 @@ function loadAuth() {
 }
 function status() {
   const auth = loadAuth();
-  console.log('\nDeepSeek аккаунт:');
+  console.log('\nDeepSeek 账号:');
   if (!auth) {
-    console.log('  ❌ deepseek-auth.json не найден');
+    console.log('  ❌ 未找到 deepseek-auth.json');
   } else {
     console.log(`  ✅ auth file: ${AUTH_PATH}`);
     console.log(`  token: ${auth.token ? 'OK (' + String(auth.token).length + ' chars)' : 'MISSING'}`);
     console.log(`  cookies: ${auth.cookie ? 'OK' : 'MISSING'}`);
-    console.log(`  Chrome profile: ${fs.existsSync(PROFILE_DIR) ? PROFILE_DIR : 'не найден'}`);
+    console.log(`  Chrome profile: ${fs.existsSync(PROFILE_DIR) ? PROFILE_DIR : '未找到'}`);
   }
 }
 function runDirectAuth() {
@@ -45,20 +45,20 @@ function runImportAuth() {
 }
 function removeLocalAuth() {
   if (fs.existsSync(AUTH_PATH)) fs.rmSync(AUTH_PATH, { force: true });
-  console.log('Удалён deepseek-auth.json. Chrome profile оставлен, чтобы не разлогинивать браузер без нужды.');
+  console.log('已删除 deepseek-auth.json。Chrome 配置目录予以保留，以免无必要地退出浏览器登录。');
 }
 function printHelp() {
   divider();
-  console.log('FreeDeepseekAPI — управление DeepSeek Web login');
+  console.log('FreeDeepseekAPI — DeepSeek Web 登录管理');
   console.log(watermark());
   divider();
-  console.log('Опции:');
-  console.log('  --login     Открыть Chrome и обновить auth');
-  console.log('  --import    Импортировать готовый deepseek-auth.json / browser cookies');
-  console.log('  --status    Показать статус auth');
-  console.log('  --remove    Удалить локальный deepseek-auth.json');
-  console.log('  --help      Справка');
-  console.log('Без опций запускается интерактивное меню.');
+  console.log('选项:');
+  console.log('  --login     打开 Chrome 并更新授权');
+  console.log('  --import    导入现成的 deepseek-auth.json / 浏览器 cookies');
+  console.log('  --status    显示授权状态');
+  console.log('  --remove    删除本地 deepseek-auth.json');
+  console.log('  --help      帮助');
+  console.log('不带参数时进入交互式菜单。');
   divider();
 }
 async function menu() {
@@ -67,16 +67,16 @@ async function menu() {
     console.log(watermark());
     status();
     divider();
-    console.log('Меню:');
-    console.log('1 - Авторизоваться / обновить DeepSeek login');
-    console.log('2 - Импортировать auth-файл / cookies');
-    console.log('3 - Показать статус');
-    console.log('4 - Удалить локальный auth файл');
-    console.log('5 - Выход');
-    const choice = (await prompt('Ваш выбор (Enter = 5): ')) || '5';
+    console.log('菜单:');
+    console.log('1 - 登录 / 更新 DeepSeek 登录状态');
+    console.log('2 - 导入授权文件 / cookies');
+    console.log('3 - 显示状态');
+    console.log('4 - 删除本地授权文件');
+    console.log('5 - 退出');
+    const choice = (await prompt('请选择（Enter = 5）：')) || '5';
     if (choice === '1') runDirectAuth();
     else if (choice === '2') runImportAuth();
-    else if (choice === '3') { status(); await prompt('\nНажмите Enter, чтобы вернуться в меню...'); }
+    else if (choice === '3') { status(); await prompt('\n按 Enter 返回菜单...'); }
     else if (choice === '4') removeLocalAuth();
     else if (choice === '5') break;
   }

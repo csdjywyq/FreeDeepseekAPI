@@ -180,7 +180,7 @@ function printBanner() {
 ██      ██   ██ ██      ██      ██   ██ ██      ██      ██      ██  ██
 ██      ██   ██ ███████ ███████ ██████  ███████ ███████ ███████ ██   ██
 
-   FreeDeepseekAPI — API-прокси для DeepSeek Web Chat
+   FreeDeepseekAPI — DeepSeek Web Chat 的 API 代理
    ${formatWatermark()}
 `);
 }
@@ -532,10 +532,10 @@ function sweepIdleSessions(maxIdleMs = SESSION_TTL_MS * 2) {
 // solvePOW() lives in lib/pow (compiled-module cache + WASM-fetch timeout),
 // shared with client.js. Called as solvePOW(challenge, wasmUrl).
 
-// DeepSeek Web merged its “Быстрый” (Instant), “Эксперт” (Expert) and
-// “Распознавание” (Vision) modes into a single unified mode on 2026-09-10 and
+// DeepSeek Web merged its “快速” (Instant), “专家” (Expert) and
+// “识别” (Vision) modes into a single unified mode on 2026-09-10 and
 // retired V4 Pro on 2026-09-14 (#31). Every request now goes to the same
-// model_type; only the “DeepThink” (thinking_enabled) and “Search”
+// model_type; only the “深度思考” (thinking_enabled) and “搜索”
 // (search_enabled) toggles remain. The old aliases stay accepted so existing
 // client configs keep working. DEEPSEEK_MODEL_TYPE overrides the model_type
 // sent upstream; set it to an empty value to omit the field entirely.
@@ -2394,6 +2394,7 @@ function isContextTooLongError(error) {
     const message = typeof error === 'string'
         ? error
         : `${error?.content || ''} ${error?.message || ''} ${error?.finish_reason || ''} ${error?.type || ''}`;
+    // 正则中的俄文片段用于匹配 DeepSeek 上游返回的原始报错文本，属功能代码，故意保留原文。
     return /(?:content|prompt|context).{0,40}(?:too\s+long|too\s+large|length|limit|maximum)|maximum.{0,30}(?:context|token)|too\s+many\s+tokens|содержани[ея]\s+слишком\s+длин|контекст.{0,30}(?:длин|лимит)|内容.{0,12}(?:过长|太长)|上下文.{0,12}(?:过长|超出)/i.test(message);
 }
 
@@ -2410,6 +2411,7 @@ function isRateLimitError(error) {
     const message = typeof error === 'string'
         ? error
         : `${error?.content || ''} ${error?.message || ''} ${error?.type || ''}`;
+    // 同上：俄文片段匹配上游原文报错，保留以维持兼容。
     return /too\s+many\s+(?:messages|requests)|rate[\s_-]?limit|过于频繁|слишком\s+(?:много\s+(?:сообщений|запросов)|частые\s+сообщения)/i.test(message);
 }
 
@@ -3325,11 +3327,11 @@ async function runAuthScript() {
 
 function printStatus() {
     console.log(`\n${formatWatermark()}`);
-    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ не найден deepseek-auth.json'}`);
+    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ 未找到 deepseek-auth.json'}`);
     console.log(`Auth source: ${process.env.DEEPSEEK_AUTH_DIR || DS_CONFIG_PATH}`);
-    console.log(`Аккаунты: ${accounts.length ? accounts.map(a => `${a.id}${a.cooldownUntil > Date.now() ? ' (cooldown)' : ''}`).join(', ') : 'нет'}`);
-    console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.join(', ')}`);
-    console.log('Нерабочие/скрытые aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
+    console.log(`账号: ${accounts.length ? accounts.map(a => `${a.id}${a.cooldownUntil > Date.now() ? ' (cooldown)' : ''}`).join(', ') : '无'}`);
+    console.log(`可用模型: ${SUPPORTED_MODEL_IDS.join(', ')}`);
+    console.log('不可用/隐藏的 aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
     console.log('Capabilities: GET /v1/model-capabilities');
 }
 
@@ -3340,14 +3342,14 @@ async function showStartupMenu() {
     }
     while (true) {
         printStatus();
-        console.log('\n=== Меню ===');
+        console.log('\n=== 菜单 ===');
         console.log(`ForgetMeAI: ${FORGETMEAI_WATERMARK}`);
-        console.log('1 - Авторизоваться / обновить DeepSeek login');
-        console.log('2 - Импортировать auth-файл / cookies');
-        console.log('3 - Показать модели и статусы');
-        console.log('4 - Запустить прокси (по умолчанию)');
-        console.log('5 - Выход');
-        let choice = await prompt('Ваш выбор (Enter = 4): ');
+        console.log('1 - 登录 / 更新 DeepSeek 登录状态');
+        console.log('2 - 导入授权文件 / cookies');
+        console.log('3 - 显示模型与状态');
+        console.log('4 - 启动代理（默认）');
+        console.log('5 - 退出');
+        let choice = await prompt('请选择（Enter = 4）：');
         if (!choice) choice = '4';
         if (choice === '1') {
             await runAuthScript();
@@ -3356,10 +3358,10 @@ async function showStartupMenu() {
             loadDeepSeekConfig({ fatal: false });
         } else if (choice === '3') {
             console.log(JSON.stringify(ALL_MODEL_CAPABILITIES, null, 2));
-            await prompt('\nНажмите Enter, чтобы вернуться в меню...');
+            await prompt('\n按 Enter 返回菜单...');
         } else if (choice === '4') {
             if (!hasAuthConfig()) {
-                console.log('Нужен deepseek-auth.json. Запустите пункт 1 или 2.');
+                console.log('需要 deepseek-auth.json，请先执行第 1 或第 2 项。');
                 continue;
             }
             return true;

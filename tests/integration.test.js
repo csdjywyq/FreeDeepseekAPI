@@ -279,8 +279,8 @@ test('long generations outlive the connect timeout, stalled streams time out', a
 });
 
 test('request bodies are decoded as UTF-8 even when a character is split across chunks', async () => {
-  const payload = Buffer.from(JSON.stringify({ model: 'deepseek-chat', user: 'utf8', messages: [{ role: 'user', content: 'Привет, мир' }] }), 'utf8');
-  const splitAt = payload.indexOf(Buffer.from('р', 'utf8')) + 1; // inside a 2-byte character
+  const payload = Buffer.from(JSON.stringify({ model: 'deepseek-chat', user: 'utf8', messages: [{ role: 'user', content: '你好，世界' }] }), 'utf8');
+  const splitAt = payload.indexOf(Buffer.from('好', 'utf8')) + 1; // 切在一个 3 字节字符中间
   const status = await new Promise((resolve, reject) => {
     const req = http.request(`${proxyUrl}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length } }, res => {
       res.resume();
@@ -291,7 +291,7 @@ test('request bodies are decoded as UTF-8 even when a character is split across 
     setTimeout(() => req.end(payload.subarray(splitAt)), 50);
   });
   assert.equal(status, 200);
-  assert.match(mock.state.completions.at(-1).body.prompt, /Привет, мир/);
+  assert.match(mock.state.completions.at(-1).body.prompt, /你好，世界/);
 });
 
 test('a throttled account fails over to the next ready account', async () => {
@@ -385,6 +385,7 @@ test('a throttled turn keeps the remote chat for the next request', async () => 
 });
 
 test('Russian SSE throttle returns 429, cools down the account, then recovers after cooldown', async () => {
+  // 以下俄文均为 DeepSeek 上游本地化报错原文，作为 mock 响应样本保留。
   mock.state.respond = () => ({ error: 'Слишком частые сообщения. Повторите попытку позже.' });
   const throttled = await chat({ model: 'deepseek-chat', user: 'russian-sse-throttle', messages: [{ role: 'user', content: 'first' }] });
   assert.equal(throttled.status, 429, throttled.text);
